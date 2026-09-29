@@ -26,7 +26,9 @@ env:
 jobs:
   build:
     name: Build unsigned SFI (iOS) IPA
-    runs-on: macos-26
+    # Upstream sing-box CI builds the Apple clients on the xcode-27 image; the
+    # iOS 26.x SDK (macos-26) fails to compile SFI (ToolbarContentBuilder.buildIf availability).
+    runs-on: xcode-27
     timeout-minutes: 150
     steps:
       - name: Checkout sing-box-for-apple
@@ -39,14 +41,12 @@ jobs:
         run: |
           set -euo pipefail
           ls -d /Applications/Xcode*.app || true
-          XCODE=""
-          for v in 26.6 26.5 26.4.1; do
-            if [ -d "/Applications/Xcode_${v}.app" ]; then XCODE="/Applications/Xcode_${v}.app"; break; fi
-          done
-          [ -n "$XCODE" ] || XCODE="/Applications/Xcode.app"
+          # On the xcode-27 image /Applications/Xcode.app is the (only) Xcode 27 install.
+          XCODE="/Applications/Xcode.app"
           sudo xcode-select -s "$XCODE/Contents/Developer"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
+          command -v xcbeautify || brew install xcbeautify
 
       - name: Setup Go
         uses: actions/setup-go@v5
