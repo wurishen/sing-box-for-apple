@@ -1,0 +1,154 @@
+name: Unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      sing_box_ref:
+        description: "SagerNet/sing-box ref (tag/branch) used to build Libbox.xcframework"
+        required: false
+        default: "v1.15.0-alpha.9"
+  push:
+    branches:
+      - dev
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SING_BOX_REF: ${{ inputs.sing_box_ref || 'v1.15.0-alpha.9' }}
+  GO_VERSION: "1.26.8"
+  DISABLE_SWIFTLINT: "1"
+
+jobs:
+  build:
+    name: Build unsigned SFI (iOS) IPA
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - name: Checkout sing-box-for-apple
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app || true
+          XCODE=""
+          for v in 26.6 26.5 26.4.1; do
+            if [ -d "/Applications/Xcode_${v}.app" ]; then XCODE="/Applications/Xcode_${v}.app"; break; fi
+          done
+          [ -n "$XCODE" ] || XCODE="/Applications/Xcode.app"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Checkout sing-box (Go core)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$SING_BOX_REF" https://github.com/SagerNet/sing-box.git "$RUNNER_TEMP/sing-box"
+          cd "$RUNNER_TEMP/sing-box"
+          git log -1 --format='%H %ci %s'
+          go version
+
+      - name: Patch Go for iOS (optional, upstream perf patch)
+        working-directory: ${{ runner.temp }}/sing-box
+        run: |
+          if [ -x .github/patch_go_for_ios.sh ]; then
+            .github/patch_go_for_ios.sh || echo "::warning::Go iOS patch failed; continuing with stock Go"
+          fi
+
+      - name: Build Libbox.xcframework (ios/arm64)
+        working-directory: ${{ runner.temp }}/sing-box
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go run ./cmd/internal/build_libbox -target apple -platform ios/arm64
+          rm -rf "$GITHUB_WORKSPACE/Libbox.xcframework"
+          if [ -d Libbox.xcframework ]; then
+            mv Libbox.xcframework "$GITHUB_WORKSPACE/"
+          elif [ -d ../sing-box-for-apple/Libbox.xcframework ]; then
+            mv ../sing-box-for-apple/Libbox.xcframework "$GITHUB_WORKSPACE/"
+          else
+            echo "Libbox.xcframework not found" >&2; exit 1
+          fi
+          ls -la "$GITHUB_WORKSPACE/Libbox.xcframework"
+
+      - name: Archive SFI (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project sing-box.xcodeproj \
+            -scheme SFI \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/SFI.xcarchive \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ENABLE_BITCODE=NO \
+            | xcbeautify --renderer github-actions
+          test -d build/SFI.xcarchive/Products/Applications
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="$(ls -d build/SFI.xcarchive/Products/Applications/*.app | head -n1)"
+          echo "App: $APP"
+          ls "$APP/PlugIns" 2>/dev/null || echo "(no PlugIns)"
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          (cd build/ipa && zip -qry ../../sing-box-unsigned.ipa Payload)
+          ls -la sing-box-unsigned.ipa
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" || echo unknown)
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist" || echo unknown)
+          echo "APP_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "APP_BUILD=$BUILD" >> "$GITHUB_ENV"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-unsigned-ipa
+          path: sing-box-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="unsigned-${{ github.run_number }}"
+          cat > notes.md <<NOTES
+          Unsigned iOS build of sing-box (SFI) ${APP_VERSION} (${APP_BUILD}).
+
+          - sing-box-for-apple commit: ${GITHUB_SHA}
+          - sing-box (Libbox) ref: ${SING_BOX_REF}
+          - Built with: $(xcodebuild -version | head -n1)
+
+          This IPA is NOT signed. Re-sign it (e.g. Sideloadly / AltStore / your own certificate) before installing.
+          The VPN (Network Extension) requires the Network Extension entitlement and matching App Group; free Apple IDs cannot grant it.
+          NOTES
+          gh release create "$TAG" sing-box-unsigned.ipa \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "sing-box unsigned IPA ${APP_VERSION} (#${{ github.run_number }})" \
+            --notes-file notes.md \
+            --prerelease
